@@ -1,6 +1,9 @@
-import re, math, time, random
+import re, time, random
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from collections import defaultdict, Counter
+from collections import Counter
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -63,6 +66,14 @@ LOG_TEMPLATES = {
     }
 }
 
+# 重算与主分析共用的统计口径参数（改动即同时影响两者，保证口径一致）
+WINDOW_SIZE = 20          # 每个窗口的条目数
+SIGMA_THRESHOLD = 2.5     # 3-sigma 命中阈值
+IQR_SCORE_THRESHOLD = 3.0 # IQR 分数命中阈值
+LEVEL_ALERT_TYPE = "level"
+COUNT_ALERT_TYPE = "count"
+KEYWORD_ALERT_TYPE = "keyword"
+
 
 class GenerateRequest(BaseModel):
     type: str = "nginx"
@@ -73,6 +84,40 @@ class DetectRequest(BaseModel):
     logs: list
     rules: list = []
     query: str = ""
+
+
+class RecomputeScope(BaseModel):
+    # 为空列表表示不限来源；start/end 为 unix 秒，None 表示不限
+    sources: List[str] = []
+    start: Optional[float] = None
+    end: Optional[float] = None
+
+
+class RecomputeJob(BaseModel):
+    jobId: Optional[str] = None
+    label: str = ""
+    scope: RecomputeScope
+
+
+class RecomputeRequest(BaseModel):
+    logs: list
+    rules: list = []
+    job: RecomputeJob
+
+
+class _BadRequest(Exception):
+    def __init__(self, message: str):
+        self.message = message
+
+
+def _bad_request(message: str) -> Exception:
+    return _BadRequest(message)
+
+
+@app.exception_handler(_BadRequest)
+def _bad_request_handler(request, exc: _BadRequest):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=400, content={"detail": exc.message})
 
 
 @app.post("/api/generate")
@@ -97,30 +142,77 @@ def detect_anomalies(req: DetectRequest):
     return analyze_logs(req.logs, req.rules, req.query)
 
 
-def analyze_logs(logs_data, rules, query):
-    logs = logs_data
-    n = len(logs)
+@app.post("/api/recompute")
+def recompute(req: RecomputeRequest):
+    """对单条重算任务按与主分析完全一致的口径重新计算条目数/得分/命中判定项。"""
+    logs = req.logs or []
+    scope = req.job.scope
+    sources = set(s for s in (scope.sources or []) if s)
+    rules = [r for r in (req.rules or []) if isinstance(r, dict) and r.get("enabled", True)]
 
-    # Time windows (1min each for demonstration)
-    window_size = 20
+    if scope.start is not None and scope.end is not None and scope.start > scope.end:
+        raise _bad_request("时间范围起始晚于结束，请调整后重试")
+    if sources:
+        available = {l.get("source") for l in logs}
+        unknown = sorted(sources - available)
+        if unknown:
+            raise _bad_request(f"来源不存在于当前数据中：{', '.join(unknown)}")
+
+    subset = [l for l in logs if _in_scope(l, sources, scope.start, scope.end)]
+    if not subset:
+        target = _scope_description(sources, scope.start, scope.end)
+        raise _bad_request(f"范围内没有可重算的日志（{target}），请扩大范围后重试")
+
+    stats = compute_stats(subset, rules)
+    return {
+        "jobId": req.job.jobId,
+        "label": req.job.label,
+        "scope": {
+            "sources": sorted(sources),
+            "start": scope.start,
+            "end": scope.end,
+        },
+        "matched": len(subset),
+        "totalScanned": len(logs),
+        "avgSigmaScore": stats["avgSigmaScore"],
+        "maxSigmaScore": stats["maxSigmaScore"],
+        "avgIqrScore": stats["avgIqrScore"],
+        "maxIqrScore": stats["maxIqrScore"],
+        "anomalyWindows": stats["anomalyWindows"],
+        "windowCount": stats["windowCount"],
+        "hits": stats["hits"],
+        "caliber": stats["caliber"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 共用计算逻辑：analyze_logs（图表/主流程）与 /api/recompute 都走这里的口径
+# ---------------------------------------------------------------------------
+
+def build_windows(logs: List[dict], window_size: int = WINDOW_SIZE) -> List[dict]:
     windows = []
-    for i in range(0, n, window_size):
+    for i in range(0, len(logs), window_size):
         chunk = logs[i:i + window_size]
         levels = Counter(l["level"] for l in chunk)
         sources = Counter(l["source"] for l in chunk)
         windows.append({
-            "start": i, "end": min(i + window_size, n),
+            "start": i, "end": min(i + window_size, len(logs)),
             "count": len(chunk),
             "levels": dict(levels),
             "sources": dict(sources)
         })
+    return windows
 
-    # 3-sigma + IQR anomaly detection
+
+def score_windows(windows: List[dict], logs: List[dict]) -> List[dict]:
     counts = [w["count"] for w in windows]
-    mean = float(np.mean(counts))
-    std = float(np.std(counts)) if len(counts) > 1 else 1.0
-    q1 = float(np.percentile(counts, 25)) if len(counts) > 3 else mean - std
-    q3 = float(np.percentile(counts, 75)) if len(counts) > 3 else mean + std
+    if counts:
+        mean = float(np.mean(counts))
+        std = float(np.std(counts)) if len(counts) > 1 else 1.0
+        q1 = float(np.percentile(counts, 25)) if len(counts) > 3 else mean - std
+        q3 = float(np.percentile(counts, 75)) if len(counts) > 3 else mean + std
+    else:
+        mean, std, q1, q3 = 0.0, 1.0, 0.0, 0.0
     iqr = q3 - q1 if q3 > q1 else 1.0
 
     anomalies = []
@@ -130,16 +222,192 @@ def analyze_logs(logs_data, rules, query):
         iqr_high = q3 + 1.5 * iqr
         iqr_score = 0.0
         if w["count"] < iqr_low or w["count"] > iqr_high:
-            iqr_score = min(10.0, abs(w["count"] - (mean)) / max(iqr, 1e-5))
+            iqr_score = min(10.0, abs(w["count"] - mean) / max(iqr, 1e-5))
         anomalies.append({
             "windowIndex": i,
             "sigmaScore": round(sigma_score, 2),
             "iqrScore": round(iqr_score, 2),
-            "isAnomaly": sigma_score > 2.5 or iqr_score > 3.0,
-            "timestamp": logs[i * window_size]["timestamp"] if i * window_size < len(logs) else ""
+            "isAnomaly": sigma_score > SIGMA_THRESHOLD or iqr_score > IQR_SCORE_THRESHOLD,
+            "timestamp": logs[i * WINDOW_SIZE]["timestamp"] if i * WINDOW_SIZE < len(logs) else ""
         })
+    return anomalies
 
-    # Alert rules
+
+def rule_hits(logs: List[dict], windows: List[dict], rules: List[dict],
+              anomalies: Optional[List[dict]] = None, keyword_query: str = "") -> List[dict]:
+    """统一的判定项命中统计：阈值规则 + 统计异常 + 关键词命中。
+
+    返回每个判定项的 id/name/type/severity/count/windows，重算逐条对照以此为准。
+    """
+    hits: Dict[Tuple[str, str], dict] = {}
+
+    def bucket(hit_id: str, name: str, hit_type: str, severity: str) -> dict:
+        key = (hit_type, hit_id)
+        if key not in hits:
+            hits[key] = {
+                "id": hit_id, "name": name, "type": hit_type,
+                "severity": severity, "count": 0, "windows": []
+            }
+        return hits[key]
+
+    for rule in rules:
+        rule = rule if isinstance(rule, dict) else {}
+        rtype = rule.get("type")
+        threshold = rule.get("threshold", 5)
+        name = rule.get("name", rtype or "规则")
+        rid = str(rule.get("id", name))
+        for w in windows:
+            if rtype == LEVEL_ALERT_TYPE and w["levels"].get("ERROR", 0) > threshold:
+                h = bucket(rid, name, LEVEL_ALERT_TYPE, "high")
+                h["count"] += w["levels"]["ERROR"]
+                h["windows"].append(w["start"])
+            if rtype == COUNT_ALERT_TYPE and w["count"] > threshold:
+                h = bucket(rid, name, COUNT_ALERT_TYPE, "medium")
+                h["count"] += 1
+                h["windows"].append(w["start"])
+            if rtype == KEYWORD_ALERT_TYPE and keyword_query:
+                terms = keyword_query.lower().split()
+                kw_count = 0
+                for l in logs[w["start"]:w["end"]]:
+                    raw_lower = l.get("raw", "").lower()
+                    if terms and all(t in raw_lower for t in terms):
+                        kw_count += 1
+                if kw_count > 0:
+                    h = bucket(rid, name, KEYWORD_ALERT_TYPE, "medium")
+                    h["count"] += kw_count
+                    h["windows"].append(w["start"])
+
+    if anomalies is None:
+        anomalies = score_windows(windows, logs)
+    for a in anomalies:
+        if a["isAnomaly"]:
+            h = bucket("stat", "统计异常检测", "anomaly",
+                        "critical" if a["sigmaScore"] > 4 else "high")
+            h["count"] += 1
+            h["windows"].append(a["windowIndex"])
+
+    return list(hits.values())
+
+
+def caliber_signature(rules: List[dict]) -> dict:
+    """口径快照：固定参数 + 启用规则集，跨轮对照时用于确认口径是否一致。"""
+    return {
+        "windowSize": WINDOW_SIZE,
+        "sigmaThreshold": SIGMA_THRESHOLD,
+        "iqrScoreThreshold": IQR_SCORE_THRESHOLD,
+        "rules": sorted(
+            f"{r.get('id', r.get('name', '?'))}:{r.get('type', '?')}>{r.get('threshold', 0)}"
+            for r in rules if isinstance(r, dict) and r.get("enabled", True)
+        ),
+    }
+
+
+def compute_stats(logs: List[dict], rules: List[dict]) -> dict:
+    windows = build_windows(logs)
+    anomalies = score_windows(windows, logs)
+    hits = rule_hits(logs, windows, rules, anomalies=anomalies)
+    sig = [a["sigmaScore"] for a in anomalies]
+    iqr = [a["iqrScore"] for a in anomalies]
+    return {
+        "windowCount": len(windows),
+        "anomalyWindows": sum(1 for a in anomalies if a["isAnomaly"]),
+        "avgSigmaScore": round(float(np.mean(sig)), 2) if sig else 0.0,
+        "maxSigmaScore": round(float(np.max(sig)), 2) if sig else 0.0,
+        "avgIqrScore": round(float(np.mean(iqr)), 2) if iqr else 0.0,
+        "maxIqrScore": round(float(np.max(iqr)), 2) if iqr else 0.0,
+        "hits": hits,
+        "caliber": caliber_signature(rules),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 时间范围解析：同一批日志里存在多种时间格式，按常见格式逐种解析
+# ---------------------------------------------------------------------------
+
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+
+
+def parse_timestamp(value: Any) -> Optional[float]:
+    """把日志 timestamp 字段解析为 unix 秒；无法识别的格式返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    # 纯数字（custom 格式）
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    try:
+        # json_app ISO，如 2024-05-12T03:04:05.123Z
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.timestamp()
+    except ValueError:
+        pass
+    try:
+        # nginx，如 12/May/2024:03:04:05 +0000
+        m = re.match(r"(\d{1,2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})", s)
+        if m:
+            day, mon, year, hh, mm, ss = m.groups()
+            return datetime(int(year), _MONTHS[mon], int(day),
+                            int(hh), int(mm), int(ss)).timestamp()
+    except (ValueError, KeyError):
+        pass
+    try:
+        # apache，如 Tue May 12 03:04:05 2024
+        m = re.search(r"([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})", s)
+        if m:
+            mon, day, hh, mm, ss, year = m.groups()
+            return datetime(int(year), _MONTHS[mon], int(day),
+                            int(hh), int(mm), int(ss)).timestamp()
+    except (ValueError, KeyError):
+        pass
+    return None
+
+
+def _in_scope(log: dict, sources: set, start: Optional[float], end: Optional[float]) -> bool:
+    if sources and log.get("source") not in sources:
+        return False
+    if start is not None or end is not None:
+        ts = parse_timestamp(log.get("timestamp"))
+        if ts is None:
+            return False
+        if start is not None and ts < start:
+            return False
+        if end is not None and ts > end:
+            return False
+    return True
+
+
+def _scope_description(sources: set, start: Optional[float], end: Optional[float]) -> str:
+    parts = []
+    parts.append("来源=" + (",".join(sorted(sources)) if sources else "全部"))
+    if start is not None or end is not None:
+        parts.append(f"时间={_fmt_ts(start)} ~ {_fmt_ts(end)}")
+    return "，".join(parts)
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return "不限"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def analyze_logs(logs_data, rules, query):
+    logs = logs_data
+    n = len(logs)
+
+    # Time windows (1min each for demonstration)
+    windows = build_windows(logs)
+    anomalies = score_windows(windows, logs)
+
+    # Alert rules（保持原有告警明细与口径，图表直接消费 windows/anomalies）
     alerts = []
     for i, rule in enumerate(rules):
         rule = rule if isinstance(rule, dict) else {}
@@ -168,7 +436,7 @@ def analyze_logs(logs_data, rules, query):
                 scored.append((score, log))
         logs = [l for _, l in sorted(scored, key=lambda x: x[0], reverse=True)]
 
-    # Add non-rule alerts for high anomaly windows  
+    # Add non-rule alerts for high anomaly windows
     for a in anomalies:
         if a["isAnomaly"]:
             alerts.append({
